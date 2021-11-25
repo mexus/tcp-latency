@@ -16,34 +16,81 @@ use tcp_latency::{Args, Ping};
 use tokio::io::ReadBuf;
 use zerocopy::AsBytes;
 
+const ACCEPT_TOKEN: Token = Token(0);
+const CLIENT_TOKEN: Token = Token(1);
+const SERVER_STREAM_TOKEN: Token = Token(2);
+
 enum ServerState<'a> {
     Listening,
     Copying(ServerStream<'a>),
 }
 
 fn main() -> anyhow::Result<()> {
-    const ACCEPT_TOKEN: Token = Token(0);
-    const CLIENT_TOKEN: Token = Token(1);
-    const SERVER_STREAM_TOKEN: Token = Token(2);
     let Args {
         single_thread,
         iterations,
     } = Args::from_args();
 
-    anyhow::ensure!(single_thread, "this mode doesn't support multiple threads");
-
-    let mut poll = mio::Poll::new().context("Poll::new")?;
-    let mut events = mio::Events::with_capacity(3);
-
-    let mut listener =
+    let listener =
         TcpListener::bind((Ipv6Addr::UNSPECIFIED, 0).into()).context("TcpListener::bind")?;
     let address = listener.local_addr().context("TcpListener::local_addr")?;
+    let client = TcpStream::connect(address).context("connect")?;
+
+    let mut histogram = Histogram::<u64>::new(2).context("Histogram::new")?;
+
+    let f = if single_thread {
+        println!("Running on the current thread");
+        run_single_thread
+    } else {
+        println!("Running in multiple threads");
+        run_multi_thread
+    };
+
+    println!("Run {} instant ping-pongs", iterations);
+    let begin = Instant::now();
+    f(listener, client, &mut histogram, iterations)?;
+    let elapsed = begin.elapsed();
+
+    println!("Done in {:?}", elapsed);
+    println!("RPS: {:.2}", iterations as f64 / elapsed.as_secs_f64());
+
+    let mean = histogram.mean().round() as u64;
+    let median = histogram.value_at_quantile(0.5);
+    let p95 = histogram.value_at_quantile(0.95);
+    let p99 = histogram.value_at_quantile(0.99);
+    let max = histogram.max();
+
+    let f = |d| humantime::format_duration(Duration::from_nanos(d));
+
+    println!(
+        "\
+        mean   = {}\n\
+        median = {}\n\
+        p95    = {}\n\
+        p99    = {}\n\
+        max    = {}",
+        f(mean),
+        f(median),
+        f(p95),
+        f(p99),
+        f(max)
+    );
+
+    Ok(())
+}
+
+fn run_single_thread(
+    mut listener: TcpListener,
+    mut client: TcpStream,
+    histogram: &mut Histogram<u64>,
+    iterations: u32,
+) -> anyhow::Result<()> {
+    let mut poll = mio::Poll::new().context("Poll::new")?;
+    let mut events = mio::Events::with_capacity(3);
 
     poll.registry()
         .register(&mut listener, ACCEPT_TOKEN, Interest::READABLE)
         .context("Registering listener")?;
-
-    let mut client = TcpStream::connect(address).context("connect")?;
 
     poll.registry()
         .register(
@@ -53,17 +100,14 @@ fn main() -> anyhow::Result<()> {
         )
         .context("Registering client")?;
 
-    let mut histogram = Histogram::<u64>::new(2).context("Histogram::new")?;
-
     let mut client_ping_buffer = Ping::empty();
-    let mut client = ClientStream::new(client, &mut client_ping_buffer, &mut histogram)
+    let mut client = ClientStream::new(client, &mut client_ping_buffer, histogram)
         .context("ClientStream::new")?;
 
     let mut server_ping_buffer = Ping::empty();
     let mut server_ping_buffer_ref = Some(&mut server_ping_buffer);
     let mut server_state = ServerState::Listening;
 
-    let begin = Instant::now();
     while client.iteration() <= iterations {
         poll.poll(&mut events, None).context("poll")?;
 
@@ -96,37 +140,125 @@ fn main() -> anyhow::Result<()> {
                 token => unreachable!("Unexpected token {:?}", token),
             }
         }
-        client.run()?;
+
         match &mut server_state {
             ServerState::Listening => { /* The connection has not been accepted yet */ }
-            ServerState::Copying(stream) => stream.run()?,
+            ServerState::Copying(stream) => {
+                client.run()?;
+                stream.run()?;
+            }
         };
     }
-    let elapsed = begin.elapsed();
-    println!("Done in {:?}", elapsed);
-    println!("RPS: {:.2}", iterations as f64 / elapsed.as_secs_f64());
+    Ok(())
+}
 
-    let mean = histogram.mean().round() as u64;
-    let median = histogram.value_at_quantile(0.5);
-    let p95 = histogram.value_at_quantile(0.95);
-    let p99 = histogram.value_at_quantile(0.99);
-    let max = histogram.max();
+fn run_multi_thread(
+    listener: TcpListener,
+    client: TcpStream,
+    histogram: &mut Histogram<u64>,
+    iterations: u32,
+) -> anyhow::Result<()> {
+    crossbeam::scope(|s| {
+        let client_handle = s.spawn(|_| client_thread(client, iterations, histogram));
+        let server_handle = s.spawn(|_| server_thread(listener));
 
-    let f = |d| humantime::format_duration(Duration::from_nanos(d));
+        client_handle
+            .join()
+            .expect("Client thread panicked")
+            .context("Client thread terminated with an error")?;
 
-    println!(
-        "\
-        mean   = {}\n\
-        median = {}\n\
-        p95    = {}\n\
-        p99    = {}\n\
-        max    = {}",
-        f(mean),
-        f(median),
-        f(p95),
-        f(p99),
-        f(max)
-    );
+        if let Err(e) = server_handle
+            .join()
+            .expect("Server thread panicked")
+            .context("Server thread terminated with an error")
+        {
+            eprintln!("{:#}", e);
+        }
+        Ok::<_, anyhow::Error>(())
+    })
+    .expect("Some thread panicked")
+}
+
+fn client_thread(
+    mut client: TcpStream,
+    iterations: u32,
+    histogram: &mut Histogram<u64>,
+) -> anyhow::Result<()> {
+    let mut poll = mio::Poll::new().context("Poll::new")?;
+    let mut events = mio::Events::with_capacity(1);
+
+    poll.registry()
+        .register(
+            &mut client,
+            CLIENT_TOKEN,
+            Interest::READABLE | Interest::WRITABLE,
+        )
+        .context("Client registration")?;
+
+    let mut buffer = Ping::empty();
+    let mut client = ClientStream::new(client, &mut buffer, histogram).context("Client::new")?;
+
+    while client.iteration() <= iterations {
+        poll.poll(&mut events, None).context("Poll::poll")?;
+        for _event in &events {
+            // There's just one registered event.
+            client.run()?
+        }
+    }
+
+    Ok(())
+}
+
+fn server_thread(mut listener: TcpListener) -> anyhow::Result<()> {
+    let mut poll = mio::Poll::new().context("Poll::new")?;
+    let mut events = mio::Events::with_capacity(2);
+    poll.registry()
+        .register(&mut listener, ACCEPT_TOKEN, Interest::READABLE)
+        .context("Server registration")?;
+
+    let mut server_state = ServerState::Listening;
+
+    let mut ping_buffer = Ping::empty();
+    let mut ping_buffer_ref = Some(&mut ping_buffer);
+
+    loop {
+        poll.poll(&mut events, None).context("Poll::poll")?;
+        for event in &events {
+            match event.token() {
+                ACCEPT_TOKEN => {
+                    anyhow::ensure!(
+                        matches!(server_state, ServerState::Listening),
+                        "Connection has already been accepted"
+                    );
+                    let (mut connection, _) = listener.accept().context("TcpListener::accept")?;
+                    let ping_buffer = ping_buffer_ref
+                        .take()
+                        .context("The buffer has already been taken!")?;
+                    poll.registry()
+                        .register(
+                            &mut connection,
+                            SERVER_STREAM_TOKEN,
+                            Interest::READABLE | Interest::WRITABLE,
+                        )
+                        .context("Registering a server stream")?;
+                    server_state = ServerState::Copying(ServerStream::new(connection, ping_buffer));
+                    continue;
+                }
+                SERVER_STREAM_TOKEN => { /* Fallthrough */ }
+                token => unreachable!("Unexpected token {:?}", token),
+            }
+        }
+
+        match &mut server_state {
+            ServerState::Listening => { /* The connection has not been accepted yet */ }
+            ServerState::Copying(stream) => {
+                if stream.run()? {
+                    // Connection is closed.
+                    break;
+                }
+            }
+        };
+    }
 
     Ok(())
 }
@@ -158,7 +290,7 @@ enum ServerStreamState<'a> {
 }
 
 impl ServerStream<'_> {
-    fn run(&mut self) -> anyhow::Result<()> {
+    fn run(&mut self) -> anyhow::Result<bool> {
         loop {
             match &mut self.state {
                 ServerStreamState::Receiving(buffer) => {
@@ -172,6 +304,7 @@ impl ServerStream<'_> {
                     }
                     let buf = buffer.initialize_unfilled();
                     let bytes = match self.socket.read(buf) {
+                        Ok(0) => return Ok(true),
                         Ok(bytes) => bytes,
                         Err(e) if e.kind() == ErrorKind::WouldBlock => break,
                         Err(e) => anyhow::bail!("Server stream read error: {:#}", e),
@@ -199,7 +332,7 @@ impl ServerStream<'_> {
                 }
             }
         }
-        Ok(())
+        Ok(false)
     }
 }
 
