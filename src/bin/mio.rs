@@ -36,7 +36,7 @@ fn main() -> anyhow::Result<()> {
     let address = listener.local_addr().context("TcpListener::local_addr")?;
     let client = TcpStream::connect(address).context("connect")?;
 
-    let mut histogram = Histogram::<u64>::new(2).context("Histogram::new")?;
+    let histogram = Histogram::<u64>::new(2).context("Histogram::new")?;
 
     let f = if single_thread {
         println!("Running on the current thread");
@@ -48,7 +48,7 @@ fn main() -> anyhow::Result<()> {
 
     println!("Run {} instant ping-pongs", iterations);
     let begin = Instant::now();
-    f(listener, client, &mut histogram, iterations)?;
+    let histogram = f(listener, client, histogram, iterations)?;
     let elapsed = begin.elapsed();
 
     println!("Done in {:?}", elapsed);
@@ -82,9 +82,9 @@ fn main() -> anyhow::Result<()> {
 fn run_single_thread(
     mut listener: TcpListener,
     mut client: TcpStream,
-    histogram: &mut Histogram<u64>,
+    mut histogram: Histogram<u64>,
     iterations: u32,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Histogram<u64>> {
     let mut poll = mio::Poll::new().context("Poll::new")?;
     let mut events = mio::Events::with_capacity(3);
 
@@ -101,7 +101,7 @@ fn run_single_thread(
         .context("Registering client")?;
 
     let mut client_ping_buffer = Ping::empty();
-    let mut client = ClientStream::new(client, &mut client_ping_buffer, histogram)
+    let mut client = ClientStream::new(client, &mut client_ping_buffer, &mut histogram)
         .context("ClientStream::new")?;
 
     let mut server_ping_buffer = Ping::empty();
@@ -149,41 +149,38 @@ fn run_single_thread(
             }
         };
     }
-    Ok(())
+    Ok(histogram)
 }
 
 fn run_multi_thread(
     listener: TcpListener,
     client: TcpStream,
-    histogram: &mut Histogram<u64>,
+    histogram: Histogram<u64>,
     iterations: u32,
-) -> anyhow::Result<()> {
-    crossbeam::scope(|s| {
-        let client_handle = s.spawn(|_| client_thread(client, iterations, histogram));
-        let server_handle = s.spawn(|_| server_thread(listener));
+) -> anyhow::Result<Histogram<u64>> {
+    let client_handle = std::thread::spawn(move || client_thread(client, iterations, histogram));
+    let server_handle = std::thread::spawn(|| server_thread(listener));
 
-        client_handle
-            .join()
-            .expect("Client thread panicked")
-            .context("Client thread terminated with an error")?;
+    let histogram = client_handle
+        .join()
+        .expect("Client thread panicked")
+        .context("Client thread terminated with an error")?;
 
-        if let Err(e) = server_handle
-            .join()
-            .expect("Server thread panicked")
-            .context("Server thread terminated with an error")
-        {
-            eprintln!("{:#}", e);
-        }
-        Ok::<_, anyhow::Error>(())
-    })
-    .expect("Some thread panicked")
+    if let Err(e) = server_handle
+        .join()
+        .expect("Server thread panicked")
+        .context("Server thread terminated with an error")
+    {
+        eprintln!("{:#}", e);
+    }
+    Ok::<_, anyhow::Error>(histogram)
 }
 
 fn client_thread(
     mut client: TcpStream,
     iterations: u32,
-    histogram: &mut Histogram<u64>,
-) -> anyhow::Result<()> {
+    mut histogram: Histogram<u64>,
+) -> anyhow::Result<Histogram<u64>> {
     let mut poll = mio::Poll::new().context("Poll::new")?;
     let mut events = mio::Events::with_capacity(1);
 
@@ -196,7 +193,8 @@ fn client_thread(
         .context("Client registration")?;
 
     let mut buffer = Ping::empty();
-    let mut client = ClientStream::new(client, &mut buffer, histogram).context("Client::new")?;
+    let mut client =
+        ClientStream::new(client, &mut buffer, &mut histogram).context("Client::new")?;
 
     while client.iteration() <= iterations {
         poll.poll(&mut events, None).context("Poll::poll")?;
@@ -206,7 +204,7 @@ fn client_thread(
         }
     }
 
-    Ok(())
+    Ok(histogram)
 }
 
 fn server_thread(mut listener: TcpListener) -> anyhow::Result<()> {
