@@ -18,6 +18,8 @@ structopt = "0.3.25"
 
 mio = { version = "0.8.0", features = ["os-poll", "net"] }
 
+defer = "0.1.0"
+
 
 [profile.release]
 lto = "fat"
