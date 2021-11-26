@@ -20,6 +20,8 @@ mio = { version = "0.8.0", features = ["os-poll", "net"] }
 
 defer = "0.1.0"
 
+io-uring = "0.5.2"
+
 
 [profile.release]
 lto = "fat"
