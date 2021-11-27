@@ -322,7 +322,7 @@ fn server_thread_once(
     let bytes_read: u32 = read_done
         .result()
         .try_into()
-        .context("Reading terminated with error")?;
+        .with_context(|| format!("Reading terminated with error: {}", -read_done.result()))?;
     if bytes_read == 0 {
         return Ok(false);
     }
